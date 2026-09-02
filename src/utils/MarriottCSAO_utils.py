@@ -1,27 +1,22 @@
 """
 MarriottCSAO_utils.py
 
-Shared AWS/DynamoDB helpers for the AI Inventory scanner. This is a
-trimmed copy of the CSAO remediation codebase's MarriottCSAO_utils.py:
+Shared AWS/DynamoDB helpers for the AI Inventory scanner.
 
-  KEPT, same code as the remediation version (per instruction) —
-    getAwsClient, getAwsResourceClient, getMasterAccountId,
-    recordTimeBasedException, getRegionCoordinates, getRegionNameFromCode
-
-  REMOVED — remediation-only, not applicable to a discovery/scan Lambda:
-    getRuleAlertInfo, getRuleConfigurations, getEmailFromArn
-
-  NEW — getMonitoredSubAccounts(): AI Inventory needs to enumerate EVERY
-    sub-account to scan in one run (a scheduled bulk scan), whereas
-    S3Versioning only ever looks up ONE account per event (the account
-    the triggering event came from). There's no "list all accounts"
-    utility in the remediation codebase to reuse, so this is new — but
-    built with the exact same DynamoDB access pattern (boto3.resource,
-    Table(), try/except with backup-region retry) as every other
-    DynamoDB call in this file.
+PATCH NOTE (2026-09-03): getMasterAccountId() and getMonitoredSubAccounts()
+previously returned a variable that was only assigned inside the try
+blocks. If BOTH the primary region and every backup region raised (e.g.
+an AccessDeniedException on dynamodb:Scan, as seen in production), the
+function fell through to `return masterAccountId` with that name never
+bound in scope, raising UnboundLocalError -- which then propagated
+instead of the original, actionable AccessDeniedException. Fixed by
+initializing the variable to None up front and raising a clear
+customErrors.GenericError if it's still None after every attempt, so the
+real failure (missing IAM permission, missing DynamoDB item, etc.) is
+what actually surfaces in the logs and in lambda_handler's traceback.
 """
 import boto3
-from src.utils import logUtils
+from src.utils import logUtils, customErrors
 from src.config import config
 from boto3.dynamodb.conditions import Attr
 
@@ -56,10 +51,7 @@ def getAwsClient(client, accountId, awsRegion):
 
 
 # get AWS resource client in target account — SAME CODE as the
-# remediation codebase's getAwsResourceClient. Not currently called by
-# any handler (every AWS call in this scanner uses the low-level client,
-# not the resource API), but kept available for parity / future use —
-# e.g. a future handler that wants DynamoDB-Resource-style item access.
+# remediation codebase's getAwsResourceClient.
 def getAwsResourceClient(client, accountId, awsRegion):
     try:
         if accountId == getMasterAccountId():
@@ -85,11 +77,7 @@ def getAwsResourceClient(client, accountId, awsRegion):
 
 
 # Function to capture any resources falling under Time-based exceptions —
-# SAME CODE as the remediation codebase's recordTimeBasedException. Not
-# called anywhere in the current scan flow (there's no "exception" concept
-# for inventory discovery today), but kept per instruction so a future
-# feature — e.g. "suppress an idle-resource flag for this bucket/endpoint
-# for the next 30 days" — can reuse this without writing it from scratch.
+# SAME CODE as the remediation codebase's recordTimeBasedException.
 def recordTimeBasedException(resource, ruleName, service, accountId, region, startTime, endTime):
 
     retry = config.RETRY_ATTEMPTS
@@ -147,10 +135,15 @@ def recordTimeBasedException(resource, ruleName, service, accountId, region, sta
             return
 
 
-# SAME CODE as the remediation codebase's getMasterAccountId — scans
-# MARRIOTTCSAOSubAccountInfo (the EXISTING CSAO table, shared, not
-# recreated here) for the one row where accountType == 'master'.
+# PATCHED: getMasterAccountId — scans MARRIOTTCSAOSubAccountInfo (the
+# EXISTING CSAO table, shared, not recreated here) for the one row where
+# accountType == 'master'. `masterAccountId` is now initialized to None
+# BEFORE either try block, and the function raises a clear
+# customErrors.GenericError if it's still None after exhausting every
+# region, instead of hitting an UnboundLocalError that masks the real
+# underlying failure (e.g. AccessDeniedException on dynamodb:Scan).
 def getMasterAccountId():
+    masterAccountId = None
     try:
         dynamodb = boto3.resource('dynamodb', region_name=config.DYNAMO_DB_REGION)
         table = dynamodb.Table(config.TABLE_NAME['CSAO_MONITORED_SUB_ACCOUNTS'])
@@ -158,7 +151,6 @@ def getMasterAccountId():
             FilterExpression=Attr('accountType').eq('master')
         )
         masterAccountId = response['Items'][0]['accountId']
-
         return masterAccountId
 
     except Exception as e:
@@ -179,16 +171,34 @@ def getMasterAccountId():
             except Exception as e:
                 logUtils.logError(MODULE_NAME, e)
 
+        if masterAccountId is None:
+            # Every region failed -- surface a clear, typed error instead
+            # of an UnboundLocalError. This is almost always either a
+            # missing IAM permission (dynamodb:Scan/GetItem on
+            # MARRIOTTCSAOSubAccountInfo for THIS Lambda's execution
+            # role) or no item with accountType == 'master' in the table.
+            error = customErrors.GenericError(
+                config.GENERIC_ERROR_STATUS_CODE, config.GENERIC_ERROR_MESSAGE,
+                "Could not resolve master account id from "
+                f"{config.TABLE_NAME['CSAO_MONITORED_SUB_ACCOUNTS']} in any region "
+                f"({[config.DYNAMO_DB_REGION] + config.DYNAMO_DB_REGION_BACKUP_GT}). "
+                "Check that this Lambda's execution role has dynamodb:Scan on that "
+                "table in every listed region, and that a row with accountType='master' exists."
+            )
+            logUtils.logError(MODULE_NAME, error)
+            raise error
+
         return masterAccountId
 
 
-# NEW — analogous in shape to getMasterAccountId() above, but scans the
-# AIInventoryMonitoredAccounts table (see config.py docstring for the
-# expected item shape: accountId, scanEnabled, configuredRegions,
-# configuredServices) instead of filtering for accountType == 'master'.
-# Since this table only ever contains SUB-account rows, the master
-# account is naturally excluded — no extra filtering needed.
+# PATCHED: getMonitoredSubAccounts — same fix pattern as
+# getMasterAccountId above: `accounts` is initialized to None before
+# either try block, and a missing/failed lookup in every region raises a
+# clear customErrors.GenericError instead of returning an unbound name or
+# (worse) silently returning [] and making the whole scan look like "zero
+# accounts configured" when it's actually "couldn't reach DynamoDB".
 def getMonitoredSubAccounts():
+    accounts = None
     try:
         dynamodb = boto3.resource('dynamodb', region_name=config.DYNAMO_DB_REGION)
         table = dynamodb.Table(config.TABLE_NAME['AI_INVENTORY_MONITORED_ACCOUNTS'])
@@ -230,7 +240,19 @@ def getMonitoredSubAccounts():
             except Exception as e:
                 logUtils.logError(MODULE_NAME, e)
 
-        return []
+        if accounts is None:
+            error = customErrors.GenericError(
+                config.GENERIC_ERROR_STATUS_CODE, config.GENERIC_ERROR_MESSAGE,
+                "Could not read "
+                f"{config.TABLE_NAME['AI_INVENTORY_MONITORED_ACCOUNTS']} in any region "
+                f"({[config.DYNAMO_DB_REGION] + config.DYNAMO_DB_REGION_BACKUP_GT}). "
+                "Check that this Lambda's execution role has dynamodb:Scan on that table "
+                "in every listed region."
+            )
+            logUtils.logError(MODULE_NAME, error)
+            raise error
+
+        return accounts
 
 
 # SAME CODE as the remediation codebase's getRegionCoordinates.
