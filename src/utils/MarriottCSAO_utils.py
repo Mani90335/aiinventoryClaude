@@ -197,19 +197,26 @@ def getMasterAccountId():
 # clear customErrors.GenericError instead of returning an unbound name or
 # (worse) silently returning [] and making the whole scan look like "zero
 # accounts configured" when it's actually "couldn't reach DynamoDB".
+#
+# NOTE: the scanEnabled filter has been removed on purpose — every item
+# in AI_INVENTORY_MONITORED_ACCOUNTS (currently the same physical table
+# as CSAO_MONITORED_SUB_ACCOUNTS) is now treated as a sub-account to
+# scan, with no per-row opt-out. This also means the master row (or any
+# row with no configuredRegions) will come back in this list; it isn't
+# fatal — accountOrchestrator.scanAccount() already skips accounts with
+# no configuredRegions and logs a "NoConfiguredRegions" entry in errors
+# — but it does mean every row in the table is now in scope, including
+# ones you may not have intended to scan.
 def getMonitoredSubAccounts():
     accounts = None
     try:
         dynamodb = boto3.resource('dynamodb', region_name=config.DYNAMO_DB_REGION)
         table = dynamodb.Table(config.TABLE_NAME['AI_INVENTORY_MONITORED_ACCOUNTS'])
-        response = table.scan(
-            FilterExpression=Attr('scanEnabled').eq(True)
-        )
+        response = table.scan()
         accounts = response['Items']
 
         while 'LastEvaluatedKey' in response:
             response = table.scan(
-                FilterExpression=Attr('scanEnabled').eq(True),
                 ExclusiveStartKey=response['LastEvaluatedKey']
             )
             accounts.extend(response['Items'])
@@ -224,14 +231,11 @@ def getMonitoredSubAccounts():
             try:
                 dynamodb = boto3.resource('dynamodb', region_name=config.DYNAMO_DB_REGION_BACKUP_GT[backupTable])
                 table = dynamodb.Table(config.TABLE_NAME['AI_INVENTORY_MONITORED_ACCOUNTS'])
-                response = table.scan(
-                    FilterExpression=Attr('scanEnabled').eq(True)
-                )
+                response = table.scan()
                 accounts = response['Items']
 
                 while 'LastEvaluatedKey' in response:
                     response = table.scan(
-                        FilterExpression=Attr('scanEnabled').eq(True),
                         ExclusiveStartKey=response['LastEvaluatedKey']
                     )
                     accounts.extend(response['Items'])
