@@ -3,17 +3,25 @@ MarriottCSAO_utils.py
 
 Shared AWS/DynamoDB helpers for the AI Inventory scanner.
 
-PATCH NOTE (2026-09-03): getMasterAccountId() and getMonitoredSubAccounts()
-previously returned a variable that was only assigned inside the try
-blocks. If BOTH the primary region and every backup region raised (e.g.
-an AccessDeniedException on dynamodb:Scan, as seen in production), the
-function fell through to `return masterAccountId` with that name never
-bound in scope, raising UnboundLocalError -- which then propagated
-instead of the original, actionable AccessDeniedException. Fixed by
-initializing the variable to None up front and raising a clear
-customErrors.GenericError if it's still None after every attempt, so the
-real failure (missing IAM permission, missing DynamoDB item, etc.) is
-what actually surfaces in the logs and in lambda_handler's traceback.
+PATCH NOTE (2026-09-03, part 1): getMasterAccountId() and
+getMonitoredSubAccounts() previously returned a variable that was only
+assigned inside the try blocks. If BOTH the primary region and every
+backup region raised (e.g. an AccessDeniedException on dynamodb:Scan, as
+seen in production), the function fell through to `return
+masterAccountId` with that name never bound in scope, raising
+UnboundLocalError -- which then propagated instead of the original,
+actionable AccessDeniedException. Fixed by initializing the variable to
+None up front and raising a clear customErrors.GenericError if it's
+still None after every attempt.
+
+PATCH NOTE (2026-09-03, part 2): getMonitoredSubAccounts() now reads
+from config.TABLE_NAME['CSAO_MONITORED_SUB_ACCOUNTS'] (MARRIOTTCSAOSub
+AccountInfo) instead of a separate 'AI_INVENTORY_MONITORED_ACCOUNTS'
+table. Production's own MarriottCSAO_utils.py only has ONE account-info
+table -- MARRIOTTCSAOSubAccountInfo -- used for both the master-account
+lookup (accountType == 'master') and every sub-account row. There is no
+second table; this now matches that exactly, with no unnecessary extra
+DynamoDB table or IAM grant.
 """
 import boto3
 from src.utils import logUtils, customErrors
@@ -211,7 +219,7 @@ def getMonitoredSubAccounts():
     accounts = None
     try:
         dynamodb = boto3.resource('dynamodb', region_name=config.DYNAMO_DB_REGION)
-        table = dynamodb.Table(config.TABLE_NAME['AI_INVENTORY_MONITORED_ACCOUNTS'])
+        table = dynamodb.Table(config.TABLE_NAME['CSAO_MONITORED_SUB_ACCOUNTS'])
         response = table.scan()
         accounts = response['Items']
 
@@ -230,7 +238,7 @@ def getMonitoredSubAccounts():
         for backupTable in range(len(config.DYNAMO_DB_REGION_BACKUP_GT)):
             try:
                 dynamodb = boto3.resource('dynamodb', region_name=config.DYNAMO_DB_REGION_BACKUP_GT[backupTable])
-                table = dynamodb.Table(config.TABLE_NAME['AI_INVENTORY_MONITORED_ACCOUNTS'])
+                table = dynamodb.Table(config.TABLE_NAME['CSAO_MONITORED_SUB_ACCOUNTS'])
                 response = table.scan()
                 accounts = response['Items']
 
@@ -248,7 +256,7 @@ def getMonitoredSubAccounts():
             error = customErrors.GenericError(
                 config.GENERIC_ERROR_STATUS_CODE, config.GENERIC_ERROR_MESSAGE,
                 "Could not read "
-                f"{config.TABLE_NAME['AI_INVENTORY_MONITORED_ACCOUNTS']} in any region "
+                f"{config.TABLE_NAME['CSAO_MONITORED_SUB_ACCOUNTS']} in any region "
                 f"({[config.DYNAMO_DB_REGION] + config.DYNAMO_DB_REGION_BACKUP_GT}). "
                 "Check that this Lambda's execution role has dynamodb:Scan on that table "
                 "in every listed region."

@@ -3,6 +3,15 @@ Filename: config.py
 Contains hard coded strings and constants for the AI resource inventory
 scanner. Follows the same shape as the CSAO remediation codebase's
 config.py — plain constants, no logic.
+
+PATCH NOTE (2026-09-03): removed the 'AI_INVENTORY_MONITORED_ACCOUNTS'
+table key. Production only ever has ONE account-info table —
+MARRIOTTCSAOSubAccountInfo — used both to find the master account
+(accountType == 'master', see MarriottCSAO_utils.getMasterAccountId) and
+now also to find every sub-account to scan. There is no second table in
+production; inventing one here was incorrect and just meant extra setup
+work (and an extra IAM grant) for no reason. Everything — master account
+row AND sub-account rows — now lives in this one table.
 """
 import os
 
@@ -50,9 +59,12 @@ EVENT_NAME = {
 TARGET_MGMT_ROLE = 'AWSCloudFormationStackSetExecutionRole'
 SESSION_NAME = 'AIInventoryScan'
 
+# SINGLE account-info table, matching production exactly. Both the
+# master-account lookup (getMasterAccountId, filters accountType ==
+# 'master') and the sub-account-scan-scope lookup (getMonitoredSubAccounts,
+# reads every row) point at this same table/key — there is only one.
 TABLE_NAME = {
-    'CSAO_MONITORED_SUB_ACCOUNTS': 'MARRIOTTCSAOSubAccountInfo',   # existing CSAO table — master-account lookup only
-    'AI_INVENTORY_MONITORED_ACCOUNTS': 'AIInventoryMonitoredAccounts',  # new — which sub-accounts/regions/services to scan
+    'CSAO_MONITORED_SUB_ACCOUNTS': 'MARRIOTTCSAOSubAccountInfo',
 }
 
 # Used only by recordTimeBasedException (kept for parity — see that
@@ -81,18 +93,28 @@ CLOUDWATCH_LOOKBACK_DAYS = int(os.environ.get("CLOUDWATCH_LOOKBACK_DAYS", "30"))
 MAX_CONCURRENT_ACCOUNTS = int(os.environ.get("MAX_CONCURRENT_ACCOUNTS", "5"))
 
 """
-Required DynamoDB tables (see module docstring / helper functions for shape):
-  MARRIOTTCSAOSubAccountInfo    -- existing CSAO table, one row with accountType='master'
-  AIInventoryMonitoredAccounts  -- one row per sub-account to scan:
-                                    { accountId, scanEnabled, configuredRegions, configuredServices }
+Required DynamoDB table (single table, matching production):
+  MARRIOTTCSAOSubAccountInfo
+    - one row with accountType == 'master'            -> used by getMasterAccountId()
+    - one row per sub-account to scan, each with:
+        accountId, configuredRegions (list), configuredServices (list, optional)
+      -> used by getMonitoredSubAccounts()
+    A single row MAY be both (accountType == 'master' AND also carry
+    configuredRegions/configuredServices) if you want the master account
+    itself included in the scan — nothing in the code prevents that.
 
 Required IAM permissions for SCAN_ROLE (TARGET_MGMT_ROLE) in every sub-account:
   sagemaker:List*, comprehend:List*, bedrock:List*, bedrock-agent:List*,
   bedrock:GetModelInvocationLoggingConfiguration, cloudwatch:ListMetrics,
-  cloudwatch:GetMetricStatistics, cloudtrail:LookupEvents, sts:GetCallerIdentity
+  cloudwatch:GetMetricStatistics, cloudtrail:LookupEvents, sts:GetCallerIdentity,
+  ec2:DescribeRegions   -- NEW: used to auto-discover an account's enabled
+                            regions when its DynamoDB row has no
+                            configuredRegions override (see accountOrchestrator
+                            ._discoverAccountRegions)
 
 Required IAM permissions for the MASTER account's Lambda execution role:
   sts:AssumeRole on arn:aws:iam::*:role/<TARGET_MGMT_ROLE>
-  dynamodb:GetItem, dynamodb:Scan on MARRIOTTCSAOSubAccountInfo and AIInventoryMonitoredAccounts
+  dynamodb:Scan, dynamodb:GetItem on MARRIOTTCSAOSubAccountInfo (in DYNAMO_DB_REGION
+    AND every region listed in DYNAMO_DB_REGION_BACKUP_GT)
   s3:PutObject on OUTPUT_BUCKET
 """

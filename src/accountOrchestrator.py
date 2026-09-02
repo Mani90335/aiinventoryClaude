@@ -7,10 +7,21 @@ from the triggering event), this scanner must cover EVERY monitored
 account in one run — so lambda_function.py calls scanAccount() once per
 item returned by MarriottCSAO_utils.getMonitoredSubAccounts().
 
-Region and service scope come from the account's own DynamoDB row
-(configuredRegions / configuredServices) — this is the "same DynamoDB
-flow" as the account-config lookups elsewhere in this codebase, applied
-to decide WHERE to scan, not just WHETHER a rule is enabled.
+PATCH NOTE (2026-09-03): region scope no longer REQUIRES a
+'configuredRegions' attribute in DynamoDB. S3Versioning.py (and every
+other event-driven remediation handler in production) never stores a
+region list per account at all — it always pulls the region straight off
+the triggering CloudTrail/Config event. AI Inventory has no triggering
+event to read a region from (it's a scheduled bulk scan, not
+event-driven), so it can't copy that exactly — but it CAN match the same
+underlying philosophy: don't require a manual per-account setup step.
+'configuredRegions' in DynamoDB is now an OPTIONAL override (handy for
+narrowing a test run to one region) rather than a hard requirement; when
+it's absent, regions are auto-discovered per account via
+ec2:DescribeRegions, the same way the very first version of this scanner
+worked. An account with zero enabled regions (or a broken EC2 permission)
+is still skipped and logged — but that's now a genuine "couldn't
+discover any regions" case, not "forgot to set an attribute in DynamoDB".
 """
 from src.utils import logUtils, MarriottCSAO_utils
 from src.helpers import cloudTrailHelper, cloudWatchHelper
@@ -34,7 +45,10 @@ HANDLER_CLASSES = {
 def scanAccount(accountInfo):
     """
     accountInfo: one item from MarriottCSAO_utils.getMonitoredSubAccounts()
-      — expected shape: {accountId, scanEnabled, configuredRegions, configuredServices}
+      — expected shape: {accountId, configuredRegions?, configuredServices?}
+      (configuredRegions / configuredServices are both OPTIONAL overrides;
+      see _discoverAccountRegions() and config.SERVICES for the defaults
+      used when they're absent.)
 
     Returns:
       {
@@ -57,15 +71,32 @@ def scanAccount(accountInfo):
     }
 
     try:
-        regions = accountInfo.get("configuredRegions") or []
         services = accountInfo.get("configuredServices") or config.SERVICES
 
+        # configuredRegions is an OPTIONAL manual override (e.g. to
+        # narrow a test run to one region). When absent, auto-discover
+        # every enabled region for this account instead of requiring it
+        # to be set in DynamoDB.
+        regions = accountInfo.get("configuredRegions")
         if not regions:
-            logUtils.logInfo(MODULE_NAME, f"[{accountId}] No configuredRegions in DynamoDB — skipping account")
+            logUtils.logDebug(
+                MODULE_NAME,
+                f"[{accountId}] No configuredRegions override — auto-discovering enabled regions"
+            )
+            regions = _discoverAccountRegions(accountId)
+
+        if not regions:
+            logUtils.logInfo(
+                MODULE_NAME,
+                f"[{accountId}] Could not determine any region to scan (no override, "
+                "and ec2:DescribeRegions returned nothing/failed) — skipping account"
+            )
             result["errors"].append({
                 "account": accountId, "region": None, "source": "accountOrchestrator",
-                "error_type": "NoConfiguredRegions",
-                "error": f"AIInventoryMonitoredAccounts item for {accountId} has no configuredRegions",
+                "error_type": "NoRegionsResolved",
+                "error": f"No configuredRegions override and region auto-discovery found "
+                         f"nothing for {accountId} — check ec2:DescribeRegions permission "
+                         f"on {config.TARGET_MGMT_ROLE} in that account.",
             })
             return result
 
@@ -113,6 +144,28 @@ def scanAccount(accountInfo):
         })
 
     return result
+
+
+def _discoverAccountRegions(accountId):
+    """
+    Inside " + _discoverAccountRegions.__name__ — returns every region
+    enabled for this account, via ec2:DescribeRegions (AllRegions=False
+    returns only OPTED-IN/enabled regions, same call used by the very
+    first version of this scanner). Uses the same getAwsClient flow as
+    every other AWS call here, so it transparently assumes into the
+    sub-account if needed. Always returns a list (never raises) — a
+    failure here is just "no regions discovered", handled by the caller.
+    """
+    logUtils.logInfo(MODULE_NAME, "Inside " + _discoverAccountRegions.__name__)
+    try:
+        ec2Client = MarriottCSAO_utils.getAwsClient(config.SERVICE_NAME['EC2'], accountId, 'us-east-1')
+        if not ec2Client:
+            return []
+        response = ec2Client.describe_regions(AllRegions=False)
+        return sorted(r['RegionName'] for r in response['Regions'])
+    except Exception as e:
+        logUtils.logError(MODULE_NAME, e)
+        return []
 
 
 # ---------------------------------------------------------------------
